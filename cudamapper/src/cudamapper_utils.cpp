@@ -46,7 +46,7 @@ void fuse_overlaps(std::vector<Overlap>& fused_overlaps, const std::vector<Overl
     for (size_t i = 0; i < unfused_overlaps.size() - 1; i++)
     {
         const Overlap& next_overlap = unfused_overlaps[i + 1];
-        if ((fused_overlap.target_read_id_ == next_overlap.target_read_id_) &&
+        /*if ((fused_overlap.target_read_id_ == next_overlap.target_read_id_) &&
             (fused_overlap.query_read_id_ == next_overlap.query_read_id_))
         {
             //need to fuse
@@ -55,6 +55,7 @@ void fuse_overlaps(std::vector<Overlap>& fused_overlaps, const std::vector<Overl
             fused_overlap.target_end_position_in_read_ = next_overlap.target_end_position_in_read_;
         }
         else
+	*/
         {
             set_relative_strand(fused_overlap);
             fused_overlaps.push_back(fused_overlap);
@@ -65,5 +66,6 @@ void fuse_overlaps(std::vector<Overlap>& fused_overlaps, const std::vector<Overl
     set_relative_strand(fused_overlap);
     fused_overlaps.push_back(fused_overlap);
 }
+
 } // namespace cudamapper
 } // namespace claragenomics

@@ -71,8 +71,12 @@ __host__ __device__ bool operator==(const cuOverlapKey& key0,
 {
     const Anchor* a = key0.anchor;
     const Anchor* b = key1.anchor;
+    //return (a->target_read_id_ == b->target_read_id_) && (a->query_read_id_ == b->query_read_id_);
+
     return (a->target_read_id_ == b->target_read_id_) &&
-           (a->query_read_id_ == b->query_read_id_);
+           (a->query_read_id_ == b->query_read_id_) &&
+           (a->query_position_in_read_ == b->query_position_in_read_) &&
+           (a->target_position_in_read_ == b->target_position_in_read_);
 }
 
 struct cuOverlapArgs
@@ -171,6 +175,111 @@ struct CreateOverlap
         return new_overlap;
     };
 };
+
+void get_overlaps_seq(std::vector<Overlap>& fused_overlaps,
+                      thrust::device_vector<Anchor>& d_anchors,
+                      const Index& index_query,
+                      const Index& index_target)
+{
+    auto n_anchors = d_anchors.size();
+    thrust::host_vector<Anchor> anchors(d_anchors);
+
+    //Loop through the overlaps, "trigger" when an overlap is detected and add it to vector of overlaps
+    //when the overlap is left
+    std::vector<Overlap> overlaps;
+
+    bool in_chain                  = false;
+    uint16_t tail_length           = 0;
+    uint16_t tail_length_for_chain = 3;
+    uint16_t score_threshold       = 1;
+    Anchor overlap_start_anchor;
+    Anchor prev_anchor;
+    Anchor current_anchor;
+
+    //Very simple scoring function to quantify quality of overlaps.
+    auto anchor_score = [](Anchor lhs, Anchor rhs) {
+        auto score = 1;
+        if ((rhs.query_position_in_read_ - lhs.query_position_in_read_) < 350 and abs(int(rhs.target_position_in_read_) - int(lhs.target_position_in_read_)) < 350)
+            score = 2;
+        return score;
+    };
+
+    //Add an anchor to an overlap
+    auto terminate_anchor = [&]() {
+        Overlap new_overlap;
+
+        std::string query_read_name  = index_query.read_id_to_read_name(prev_anchor.query_read_id_);
+        new_overlap.query_read_name_ = new char[query_read_name.length()];
+        strcpy(new_overlap.query_read_name_, query_read_name.c_str());
+
+        std::string target_read_name  = index_target.read_id_to_read_name(prev_anchor.target_read_id_);
+        new_overlap.target_read_name_ = new char[target_read_name.length()];
+        strcpy(new_overlap.target_read_name_, target_read_name.c_str());
+
+        new_overlap.query_read_id_                 = prev_anchor.query_read_id_;
+        new_overlap.target_read_id_                = prev_anchor.target_read_id_;
+        new_overlap.query_length_                  = index_query.read_id_to_read_length(prev_anchor.query_read_id_);
+        new_overlap.target_length_                 = index_target.read_id_to_read_length(prev_anchor.target_read_id_);
+        new_overlap.num_residues_                  = tail_length;
+        new_overlap.target_end_position_in_read_   = prev_anchor.target_position_in_read_;
+        new_overlap.target_start_position_in_read_ = overlap_start_anchor.target_position_in_read_;
+        new_overlap.query_end_position_in_read_    = prev_anchor.query_position_in_read_;
+        new_overlap.query_start_position_in_read_  = overlap_start_anchor.query_position_in_read_;
+        new_overlap.overlap_complete               = true;
+        overlaps.push_back(new_overlap);
+    };
+
+    for (size_t i = 0; i < anchors.size(); i++)
+    {
+        current_anchor = anchors[i];
+        if ((current_anchor.query_read_id_ == prev_anchor.query_read_id_) && (current_anchor.target_read_id_ == prev_anchor.target_read_id_))
+        { //TODO: For first anchor where prev anchor is not initialised can give incorrect result
+            //In the same read pairing as before
+            int score = anchor_score(prev_anchor, current_anchor);
+            if (score > score_threshold)
+            {
+                tail_length++;
+                if (tail_length == tail_length_for_chain)
+                { //we enter a chain
+                    in_chain             = true;
+                    overlap_start_anchor = anchors[i - tail_length + 1]; //TODO check
+                }
+            }
+            else
+            {
+                if (in_chain)
+                {
+                    terminate_anchor();
+                }
+
+                tail_length = 1;
+                in_chain    = false;
+            }
+            prev_anchor = current_anchor;
+        }
+        else
+        {
+            //In a new read pairing
+            if (in_chain)
+            {
+                terminate_anchor();
+            }
+            //Reinitialise all values
+            tail_length = 1;
+            in_chain    = false;
+            prev_anchor = current_anchor;
+        }
+    }
+
+    //terminate any hanging anchors
+    if (in_chain)
+    {
+        terminate_anchor();
+    }
+
+    //Fuse overlaps
+    fuse_overlaps(fused_overlaps, overlaps);
+}
 
 void OverlapperTriggered::get_overlaps(std::vector<Overlap>& fused_overlaps,
                                        thrust::device_vector<Anchor>& d_anchors,
@@ -351,6 +460,33 @@ void OverlapperTriggered::get_overlaps(std::vector<Overlap>& fused_overlaps,
 
                           return new_overlap;
                       });
+
+    std::vector<Overlap> cpu_fused_overlaps;
+    get_overlaps_seq(cpu_fused_overlaps,
+                     d_anchors,
+                     index_query,
+                     index_target);
+    bool equal = std::equal(fused_overlaps.begin(), fused_overlaps.end(), cpu_fused_overlaps.begin(), [](Overlap a, Overlap b) {
+        bool res = true;
+        res &= (a.query_read_id_ == b.query_read_id_);
+        res &= (a.target_read_id_ == b.target_read_id_);
+        res &= (a.query_start_position_in_read_ == b.query_start_position_in_read_);
+        res &= (a.target_start_position_in_read_ == b.target_start_position_in_read_);
+        res &= (a.query_end_position_in_read_ == b.query_end_position_in_read_);
+        res &= (a.target_end_position_in_read_ == b.target_end_position_in_read_);
+        res &= !strcmp(a.query_read_name_, b.query_read_name_);
+        res &= !strcmp(a.target_read_name_, b.target_read_name_);
+        res &= (a.num_residues_ == b.num_residues_);
+        res &= (a.query_length_ == b.query_length_);
+        res &= (a.target_length_ == b.target_length_);
+        return res;
+    });
+
+    if (!equal)
+    {
+        std::cerr << "[Debug] Results from GPU != CPU\n";
+        exit(0);
+    }
 }
 } // namespace cudamapper
 } // namespace claragenomics
